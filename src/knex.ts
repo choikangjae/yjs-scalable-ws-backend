@@ -1,3 +1,6 @@
+/**
+ * DB connection.
+ */
 import Knex from 'knex';
 import config from './config.js';
 

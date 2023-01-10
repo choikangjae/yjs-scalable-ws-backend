@@ -1,3 +1,6 @@
+/**
+ * Handle the configs from .env.local
+ */
 const config = {
   testing: process.env.JEST_WORKER_ID !== undefined,
 

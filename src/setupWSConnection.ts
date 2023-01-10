@@ -1,3 +1,6 @@
+/**
+ * It handles the buffered(defaultSize: 50) Y.Docs in Map data structure.
+ */
 import { WebSocket, Data as WSData } from 'ws';
 import http from 'http';
 import * as Y from 'yjs';
@@ -17,11 +20,14 @@ const wsReadyStateOpen = 1
 const wsReadyStateClosing = 2 // eslint-disable-line
 const wsReadyStateClosed = 3 // eslint-disable-line
 
+//Buffer Size??
 const updatesLimit = 50;
 
 export interface DBUpdate {
   id: string;
+  //The unique docName.
   docname: string;
+  //The edit events.
   update: Uint8Array;
 }
 
@@ -30,10 +36,14 @@ export const messageAwareness = 1;
 
 export const pingTimeout = 30000;
 
+//Buffered Y.Docs
 export const docs = new Map<string, WSSharedDoc>();
 
+//When Server is down.
 export function cleanup() {
+  //Erase All Y.Docs.
   docs.forEach((doc) => {
+    //A single Y.Doc can have many sessions.
     doc.conns.forEach((_, conn) => {
       closeConn(doc, conn);
     })
@@ -41,27 +51,43 @@ export function cleanup() {
 }
 
 export default async function setupWSConnection(conn: WebSocket, req: http.IncomingMessage): Promise<void> {
+  //'arraybuffer' is a spec.
   conn.binaryType = 'arraybuffer';
+  //req.url is like '/status?name=ryan'.
+  //Here the docname is 'status'.
   const docname: string = req.url?.slice(1).split('?')[0] as string;
+
+  //Create WebSocket connection.
   const [doc, isNew] = getYDoc(docname);
+
+  //Register the Y.Doc on WebSocket.
   doc.conns.set(conn, new Set());
-  
+
+  //https://github.com/websockets/ws/blob/HEAD/doc/ws.md#event-message
+  //Emitted when a message is received. data is the message content.
   conn.on('message', (message: WSData) => {
+    //encode or decode the message, and sync.
     messageListener(conn, req, doc, new Uint8Array(message as ArrayBuffer));
   });
 
+  //If the client has never had the Y.Doc before, (meaning new client is connected)
+  //retrieve the data from the source of truth and apply them.
   if (isNew) {
+
+    //Retrieve the all persisted updates.
     const persistedUpdates = await getUpdates(doc);
     const dbYDoc = new Y.Doc()
-
     dbYDoc.transact(() => {
       for (const u of persistedUpdates) {
         Y.applyUpdate(dbYDoc, u.update);
       }
     });
 
+    //Apply them to the local Y.Doc
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(dbYDoc));
 
+    //Retrieve the buffered events either.
+    //It does not pop.
     const redisUpdates = await getDocUpdatesFromQueue(doc);
     const redisYDoc = new Y.Doc();
     redisYDoc.transact(() => {
@@ -70,9 +96,11 @@ export default async function setupWSConnection(conn: WebSocket, req: http.Incom
       }
     });
 
+    //Apply them to the local Y.Doc
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(redisYDoc));
   }
 
+  //Check the connection is alive.
   let pongReceived = true;
   const pingInterval = setInterval(() => {
     if (!pongReceived) {
@@ -91,11 +119,13 @@ export default async function setupWSConnection(conn: WebSocket, req: http.Incom
     }
   }, pingTimeout);
 
+  //connection is closed.
   conn.on('close', () => {
     closeConn(doc, conn);
     clearInterval(pingInterval);
   });
 
+  //connection is still alive.
   conn.on('pong', () => {
     pongReceived = true;
   });
@@ -120,23 +150,33 @@ export default async function setupWSConnection(conn: WebSocket, req: http.Incom
 
 export const messageListener = async (conn: WebSocket, req: http.IncomingMessage, doc: WSSharedDoc, message: Uint8Array): Promise<void> => {
   // TODO: authenticate request
+
   const encoder = encoding.createEncoder();
+  //Decode binary data. The message is ephemeral.
   const decoder = decoding.createDecoder(message);
+  //It is by spec?
   const messageType = decoding.readVarUint(decoder);
+
   switch (messageType) {
     case messageSync: {
+      //Tell what to do to the encoder.
       encoding.writeVarUint(encoder, messageSync);
+      //do message sync? todo read doc.
       syncProtocol.readSyncMessage(decoder, encoder, doc, conn);
-      
+
+      //send the data over network.
       if (encoding.length(encoder) > 1) {
         send(doc, conn, encoding.toUint8Array(encoder));
       }
   
       break;
     }
+
+    //Update Awareness.
     case messageAwareness: {
       const update = decoding.readVarUint8Array(decoder);
       pub.publishBuffer(doc.awarenessChannel, Buffer.from(update));
+      //Propagate awareness event.
       awarenessProtocol.applyAwarenessUpdate(doc.awareness, update , conn);
       break;
     }
@@ -145,19 +185,23 @@ export const messageListener = async (conn: WebSocket, req: http.IncomingMessage
 }
 
 export const getUpdates = async (doc: WSSharedDoc): Promise<DBUpdate[]> => {
+  //get update history.
   const updates = await knex<DBUpdate>('items').where('docname', doc.name).orderBy('id');
 
+  //When buffer is full, apply updates.
   if (updates.length >= updatesLimit) {
     const dbYDoc = new Y.Doc();
-    
     dbYDoc.transact(() => {
       for (const u of updates) {
         Y.applyUpdate(dbYDoc, u.update);
       }
     });
 
+    //merge updates.
     const [mergedUpdates] = await Promise.all([
+      //insert updates first.
       knex<DBUpdate>('items').insert({docname: doc.name, update: Y.encodeStateAsUpdate(dbYDoc)}).returning('*'),
+      //retrieve and delete.
       knex('items').where('docname', doc.name).whereIn('id', updates.map(({id}) => id)).delete()
     ]);
 
@@ -172,16 +216,23 @@ export const persistUpdate = async (doc: WSSharedDoc, update: Uint8Array): Promi
 }
 
 export const getYDoc = (docname: string, gc=true): [WSSharedDoc, boolean] => {
+
+  //Checks whether the docname exits or not.
   const existing = docs.get(docname);
+  //If it exits, returns existed a Y.Doc and set status to false.
   if (existing) {
     return [existing, false];
   }
 
+  //If Y.Doc doesn't exist, create a new Y.Doc.
   const doc = new WSSharedDoc(docname);
+  //Set Garbage Collection options. Default value is true.
   doc.gc = gc;
 
+  //Register the created Y.Doc.
   docs.set(docname, doc);
 
+  //Returns a Y.Doc and status as List?? Why?
   return [doc, true];
 }
 
@@ -227,20 +278,24 @@ export const propagateUpdate = (doc: WSSharedDoc, update: Uint8Array) => {
 export const updateHandler = async (update: Uint8Array, origin: any, doc: WSSharedDoc): Promise<void> => {
   let isOriginWSConn = origin instanceof WebSocket && doc.conns.has(origin);
 
+  //If it is 'origin', persist the events and use redis.
   if (isOriginWSConn) {
     Promise.all([
       pub.publishBuffer(doc.name, Buffer.from(update)),
       pushDocUpdatesToQueue(doc, update)
     ]); // do not await
 
+    //Propagate events over network.
     propagateUpdate(doc, update);
 
+    //Persist events to DB.
     persistUpdate(doc, update)
       .catch((err) => {
         serverLogger.error(err);
         closeConn(doc, origin);
       })
     ;
+    //If it is not 'origin', do not persist things.
   } else {
     propagateUpdate(doc, update);
   }

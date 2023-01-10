@@ -1,3 +1,6 @@
+/**
+ * Pub, Sub Models.
+ */
 import Redis from 'ioredis';
 import config from './config.js';
 

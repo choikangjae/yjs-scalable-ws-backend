@@ -1,3 +1,6 @@
+/**
+ * DDL.
+ */
 import knex from './knex.js';
 
 export const create = async () => {
